@@ -1,0 +1,46 @@
+The following modules were not unloaded:
+  (Use "module --force purge" to unload all):
+
+  1) databases   2) releases/2023a   3) tis/2025
+Job start at Tue Dec 30 04:21:27 PM CET 2025
+Using device: cuda
+
+========================================
+Training CNN9 (eta=0.25, K=1000, tol=1e-06)
+========================================
+[Step 0] Global Cos: 1.0000 | Global RelErr: 0.0003 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 999
+[Step 100] Global Cos: 1.0000 | Global RelErr: 0.0030 | NormRatio: 0.9999 | W9 RelErr: 0.0000 | Last K: 165
+[Step 200] Global Cos: 1.0000 | Global RelErr: 0.0029 | NormRatio: 1.0001 | W9 RelErr: 0.0000 | Last K: 169
+[Step 300] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 152
+[Step 400] Global Cos: 1.0000 | Global RelErr: 0.0003 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 169
+[Step 500] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 155
+[Step 600] Global Cos: 1.0000 | Global RelErr: 0.0001 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 146
+[Step 700] Global Cos: 1.0000 | Global RelErr: 0.0011 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 166
+>>> Ep 1: Loss 1.7157 | ACC 29.58% | Avg K: 178.8
+[Step 800] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 156
+[Step 900] Global Cos: 1.0000 | Global RelErr: 0.0003 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 186
+[Step 1000] Global Cos: 1.0000 | Global RelErr: 0.0006 | NormRatio: 0.9999 | W9 RelErr: 0.0000 | Last K: 206
+[Step 1100] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 165
+[Step 1200] Global Cos: 1.0000 | Global RelErr: 0.0006 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 152
+[Step 1300] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 152
+[Step 1400] Global Cos: 1.0000 | Global RelErr: 0.0004 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 171
+[Step 1500] Global Cos: 1.0000 | Global RelErr: 0.0001 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 153
+>>> Ep 2: Loss 1.3665 | ACC 46.07% | Avg K: 168.2
+[Step 1600] Global Cos: 1.0000 | Global RelErr: 0.0001 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 159
+[Step 1700] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 153
+[Step 1800] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 166
+[Step 1900] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 157
+[Step 2000] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 154
+[Step 2100] Global Cos: 1.0000 | Global RelErr: 0.0012 | NormRatio: 1.0001 | W9 RelErr: 0.0000 | Last K: 152
+[Step 2200] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 144
+[Step 2300] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 147
+>>> Ep 3: Loss 1.1827 | ACC 54.59% | Avg K: 160.5
+[Step 2400] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 157
+[Step 2500] Global Cos: 1.0000 | Global RelErr: 0.0011 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 160
+[Step 2600] Global Cos: 1.0000 | Global RelErr: 0.0003 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 148
+[Step 2700] Global Cos: 1.0000 | Global RelErr: 0.0001 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 156
+[Step 2800] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 157
+[Step 2900] Global Cos: 1.0000 | Global RelErr: 0.0002 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 146
+[Step 3000] Global Cos: 1.0000 | Global RelErr: 0.0001 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 146
+[Step 3100] Global Cos: 1.0000 | Global RelErr: 0.0005 | NormRatio: 1.0000 | W9 RelErr: 0.0000 | Last K: 149
+>>> Ep 4: Loss 1.0449 | ACC 62.66% | Avg K: 153.8

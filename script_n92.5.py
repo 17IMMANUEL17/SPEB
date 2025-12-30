@@ -1,0 +1,582 @@
+import math
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from dataclasses import dataclass
+from torch.nn.grad import conv2d_weight
+import os
+
+torch.set_default_dtype(torch.float32)
+
+# -----------------------------
+# Activations
+# -----------------------------
+def relu(u): return torch.relu(u)
+def relu_prime(u): return (u > 0).to(u.dtype)
+
+# -----------------------------
+# Model container (CNN9)
+# -----------------------------
+@dataclass
+class CNN9:
+    # Block 1: 32x32 -> 16x16
+    W1: torch.Tensor; b1: torch.Tensor   # (64, 3, 3, 3)   s=1
+    W2: torch.Tensor; b2: torch.Tensor   # (64, 64, 3, 3)  s=2 (pool)
+    
+    # Block 2: 16x16 -> 8x8
+    W3: torch.Tensor; b3: torch.Tensor   # (128, 64, 3, 3) s=1
+    W4: torch.Tensor; b4: torch.Tensor   # (128, 128, 3, 3) s=2 (pool)
+    
+    # Block 3: 8x8 -> 4x4
+    W5: torch.Tensor; b5: torch.Tensor   # (256, 128, 3, 3) s=1
+    W6: torch.Tensor; b6: torch.Tensor   # (256, 256, 3, 3) s=2 (pool)
+    
+    # Block 4: 4x4 -> 2x2
+    W7: torch.Tensor; b7: torch.Tensor   # (512, 256, 3, 3) s=1
+    W8: torch.Tensor; b8: torch.Tensor   # (512, 512, 3, 3) s=2 (pool)
+    
+    # Classifier: 2x2 -> Flat
+    W9: torch.Tensor; b9: torch.Tensor   # (10, 512*2*2)
+
+    @property
+    def device(self): return self.W1.device
+
+# -----------------------------
+# Forward at mean states
+# -----------------------------
+@torch.no_grad()
+def forward_u_sig(net: CNN9, x0, m):
+    u = [None] * 9
+    sig = [None] * 9
+    
+    # Block 1
+    u[0] = F.conv2d(x0, net.W1, net.b1, stride=1, padding=1);   sig[0] = relu(u[0])
+    u[1] = F.conv2d(m[0], net.W2, net.b2, stride=2, padding=1); sig[1] = relu(u[1])
+    
+    # Block 2
+    u[2] = F.conv2d(m[1], net.W3, net.b3, stride=1, padding=1); sig[2] = relu(u[2])
+    u[3] = F.conv2d(m[2], net.W4, net.b4, stride=2, padding=1); sig[3] = relu(u[3])
+    
+    # Block 3
+    u[4] = F.conv2d(m[3], net.W5, net.b5, stride=1, padding=1); sig[4] = relu(u[4])
+    u[5] = F.conv2d(m[4], net.W6, net.b6, stride=2, padding=1); sig[5] = relu(u[5])
+    
+    # Block 4
+    u[6] = F.conv2d(m[5], net.W7, net.b7, stride=1, padding=1); sig[6] = relu(u[6])
+    u[7] = F.conv2d(m[6], net.W8, net.b8, stride=2, padding=1); sig[7] = relu(u[7])
+    
+    # FC
+    B = x0.shape[0]
+    m8_flat = m[7].reshape(B, -1)
+    u[8] = m8_flat @ net.W9.t() + net.b9
+    sig[8] = u[8] 
+
+    return u, sig
+
+class XZState:
+    def __init__(self, B, device):
+        self.dims = [
+            (B, 64, 32, 32), (B, 64, 16, 16),
+            (B, 128, 16, 16), (B, 128, 8, 8),
+            (B, 256, 8, 8),   (B, 256, 4, 4),
+            (B, 512, 4, 4),   (B, 512, 2, 2),
+            (B, 10)
+        ]
+        self.x = [torch.zeros(d, device=device) for d in self.dims]
+        self.z = [torch.zeros(d, device=device) for d in self.dims]
+
+    def reset(self, B, device):
+        if self.x[0].shape[0] != B:
+            self.__init__(B, device)
+
+# -----------------------------
+# Relaxation Gradient
+# -----------------------------
+@torch.no_grad()
+def xz_relax_batch_grad(
+    net: CNN9, x0, y,
+    eta=1.0, K=25,
+    state: XZState | None = None,
+    tol: float = 1e-4,
+    warm_start: bool = True,
+    beta: float = 1.0,
+):
+    device = net.device
+    B = x0.shape[0]
+    num_layers = 9
+    
+    # Label Smoothing
+    eps_ls = 0.1
+    y_onehot = F.one_hot(y, num_classes=10).to(x0.dtype)
+    y_smooth = (1.0 - eps_ls) * y_onehot + eps_ls / 10.0
+
+    if state is None:
+        state = XZState(B, device)
+    else:
+        state.reset(B, device)
+    
+    x = state.x; z = state.z
+    
+    steps_taken = 0
+    for _ in range(K):
+        steps_taken += 1
+        
+        m = [(xi + zi) * 0.5 for xi, zi in zip(x, z)]
+        s = [(xi - zi) for xi, zi in zip(x, z)]
+        
+        u, sig = forward_u_sig(net, x0, m)
+        F_err = [(si - mi) for si, mi in zip(sig, m)]
+        
+        p = torch.softmax(m[8], dim=1)
+        g_last = (p - y_smooth)
+        
+        q = [None] * num_layers
+        q[8] = s[8] 
+        for i in range(7, -1, -1):
+            q[i] = relu_prime(u[i]) * s[i]
+
+        Jt = [None] * num_layers
+        Jt[8] = -s[8] 
+        WTq8 = (q[8] @ net.W9).reshape(B, 512, 2, 2)
+        Jt[7] = -s[7] + WTq8
+        Jt[6] = -s[6] + F.conv_transpose2d(q[7], net.W8, stride=2, padding=1, output_padding=1)
+        Jt[5] = -s[5] + F.conv_transpose2d(q[6], net.W7, stride=1, padding=1)
+        Jt[4] = -s[4] + F.conv_transpose2d(q[5], net.W6, stride=2, padding=1, output_padding=1)
+        Jt[3] = -s[3] + F.conv_transpose2d(q[4], net.W5, stride=1, padding=1)
+        Jt[2] = -s[2] + F.conv_transpose2d(q[3], net.W4, stride=2, padding=1, output_padding=1)
+        Jt[1] = -s[1] + F.conv_transpose2d(q[2], net.W3, stride=1, padding=1)
+        Jt[0] = -s[0] + F.conv_transpose2d(q[1], net.W2, stride=2, padding=1, output_padding=1)
+
+        total_change = 0.0
+        # Hidden Layers
+        for i in range(8):
+            dx = F_err[i] + 0.5 * Jt[i]
+            dz = F_err[i] - 0.5 * Jt[i]
+            x[i].add_(dx, alpha=eta)
+            z[i].add_(dz, alpha=eta)
+            total_change += dx.abs().mean().item()
+            
+        # Output Layer
+        dx8 = F_err[8] + 0.5 * Jt[8] + 0.5 * beta * g_last
+        dz8 = F_err[8] - 0.5 * Jt[8] - 0.5 * beta * g_last
+        x[8].add_(dx8, alpha=eta)
+        z[8].add_(dz8, alpha=eta)
+        total_change += dx8.abs().mean().item()
+
+        if total_change < tol:
+            break
+
+    # Compute Gradients
+    m = [(xi + zi) * 0.5 for xi, zi in zip(x, z)]
+    s = [(xi - zi) for xi, zi in zip(x, z)]
+    u, _ = forward_u_sig(net, x0, m)
+    
+    delta = [None] * num_layers
+    delta[8] = s[8]
+    for i in range(8):
+        delta[i] = relu_prime(u[i]) * s[i]
+
+    gradsW = []
+    gradsb = []
+
+    # Manual conv gradients to match architecture
+    gradsW.append(conv2d_weight(x0, net.W1.shape, delta[0], stride=1, padding=1) / B)
+    gradsb.append(delta[0].sum(dim=(0,2,3)) / B)
+    
+    gradsW.append(conv2d_weight(m[0], net.W2.shape, delta[1], stride=2, padding=1) / B)
+    gradsb.append(delta[1].sum(dim=(0,2,3)) / B)
+    
+    gradsW.append(conv2d_weight(m[1], net.W3.shape, delta[2], stride=1, padding=1) / B)
+    gradsb.append(delta[2].sum(dim=(0,2,3)) / B)
+    
+    gradsW.append(conv2d_weight(m[2], net.W4.shape, delta[3], stride=2, padding=1) / B)
+    gradsb.append(delta[3].sum(dim=(0,2,3)) / B)
+    
+    gradsW.append(conv2d_weight(m[3], net.W5.shape, delta[4], stride=1, padding=1) / B)
+    gradsb.append(delta[4].sum(dim=(0,2,3)) / B)
+    
+    gradsW.append(conv2d_weight(m[4], net.W6.shape, delta[5], stride=2, padding=1) / B)
+    gradsb.append(delta[5].sum(dim=(0,2,3)) / B)
+    
+    gradsW.append(conv2d_weight(m[5], net.W7.shape, delta[6], stride=1, padding=1) / B)
+    gradsb.append(delta[6].sum(dim=(0,2,3)) / B)
+    
+    gradsW.append(conv2d_weight(m[6], net.W8.shape, delta[7], stride=2, padding=1) / B)
+    gradsb.append(delta[7].sum(dim=(0,2,3)) / B)
+    
+    m7_flat = m[7].reshape(B, -1)
+    gradsW.append((delta[8].t() @ m7_flat) / B)
+    gradsb.append(delta[8].mean(dim=0))
+
+    ce = F.cross_entropy(m[8], y).item()
+    return tuple(gradsW), tuple(gradsb), ce, steps_taken -1
+
+# -----------------------------
+# Autograd Reference
+# -----------------------------
+def autograd_grads_like_cnn9(net: CNN9, x, y):
+    params = {}
+    for i in range(1, 10):
+        params[f"W{i}"] = getattr(net, f"W{i}").detach().clone().requires_grad_(True)
+        params[f"b{i}"] = getattr(net, f"b{i}").detach().clone().requires_grad_(True)
+    
+    h = x
+    h = relu(F.conv2d(h, params['W1'], params['b1'], stride=1, padding=1))
+    h = relu(F.conv2d(h, params['W2'], params['b2'], stride=2, padding=1))
+    h = relu(F.conv2d(h, params['W3'], params['b3'], stride=1, padding=1))
+    h = relu(F.conv2d(h, params['W4'], params['b4'], stride=2, padding=1))
+    h = relu(F.conv2d(h, params['W5'], params['b5'], stride=1, padding=1))
+    h = relu(F.conv2d(h, params['W6'], params['b6'], stride=2, padding=1))
+    h = relu(F.conv2d(h, params['W7'], params['b7'], stride=1, padding=1))
+    h = relu(F.conv2d(h, params['W8'], params['b8'], stride=2, padding=1))
+    logits = h.reshape(x.size(0), -1) @ params['W9'].t() + params['b9']
+    
+    loss = F.cross_entropy(logits, y, label_smoothing=0.1)
+    loss.backward()
+    
+    gradsW = tuple(params[f"W{i}"].grad for i in range(1, 10))
+    gradsb = tuple(params[f"b{i}"].grad for i in range(1, 10))
+    return gradsW, gradsb, float(loss.detach())
+
+# -----------------------------
+# Metrics & Plotting
+# -----------------------------
+def flat_cat(tup):
+    return torch.cat([t.reshape(-1) for t in tup], dim=0)
+
+def cos_sim(a, b, eps=1e-12):
+    # Fix: Flatten tensors to 1D vectors before dot product
+    a_flat = a.flatten()
+    b_flat = b.flatten()
+    denom = (a_flat.norm() * b_flat.norm()).clamp_min(eps)
+    return float((a_flat @ b_flat) / denom)
+
+def relative_error(a, b, eps=1e-12):
+    return float((a - b).norm() / b.norm().clamp_min(eps))
+
+def set_style():
+    mpl.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "DejaVu Serif"],
+        "font.size": 14,
+        "axes.labelsize": 16,
+        "axes.titlesize": 18,
+        "lines.linewidth": 2.5,
+        "figure.figsize": (8, 6),
+    })
+
+def plot_results_icml(results, eta_values):
+    set_style()
+    plt.figure()
+    
+    styles = {
+        0.25: {'color': '#1f77b4', 'marker': 'o', 'linestyle': '-', 'label': r'$\eta=0.25$'},
+        0.50: {'color': '#ff7f0e', 'marker': 's', 'linestyle': '--', 'label': r'$\eta=0.50$'},
+        0.75: {'color': '#2ca02c', 'marker': '^', 'linestyle': '-.', 'label': r'$\eta=0.75$'},
+        1.00: {'color': '#d62728', 'marker': 'D', 'linestyle': ':', 'label': r'$\eta=1.00$'},
+    }
+    
+    for eta in eta_values:
+        if eta not in results: continue
+        data = results[eta]
+        cos_steps = data['cos_steps']
+        rel_err = data['relerr_globalW_hist']
+        if len(cos_steps) == 0: continue
+        
+        st = styles.get(eta, {'color': 'black', 'marker': 'x', 'linestyle': '-'})
+        plt.plot(cos_steps, rel_err, **st)
+
+    plt.yscale('log')
+    plt.xlabel('Training Steps')
+    plt.ylabel(r'Relative Grad Error')
+    plt.title('Global Gradient Fidelity (CNN9)')
+    plt.grid(True, which="both", ls=":", alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('cnn9_grad_fidelity.png', dpi=300)
+    print("Saved cnn9_grad_fidelity.png")
+
+def plot_convergence_icml(results, eta_values):
+    set_style()
+    plt.figure()
+    
+    styles = {
+        0.25: {'color': '#1f77b4', 'marker': 'o', 'linestyle': '-', 'label': r'$\eta=0.25$'},
+        0.50: {'color': '#ff7f0e', 'marker': 's', 'linestyle': '--', 'label': r'$\eta=0.50$'},
+        0.75: {'color': '#2ca02c', 'marker': '^', 'linestyle': '-.', 'label': r'$\eta=0.75$'},
+        1.00: {'color': '#d62728', 'marker': 'D', 'linestyle': ':', 'label': r'$\eta=1.00$'},
+    }
+    
+    for eta in eta_values:
+        if eta not in results: continue
+        data = results[eta]
+        avg_steps = data['avg_steps_per_epoch']
+        epochs = range(1, len(avg_steps) + 1)
+        
+        st = styles.get(eta, {'color': 'black', 'marker': 'x', 'linestyle': '-'})
+        plt.plot(epochs, avg_steps, **st)
+
+    plt.xlabel('Epochs')
+    plt.ylabel('Avg. Convergence Steps ($K$)')
+    plt.title('Relaxation Convergence Speed (CNN9)')
+    plt.grid(True, which="both", ls=":", alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('cnn9_convergence_steps.png', dpi=300)
+    print("Saved cnn9_convergence_steps.png")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+@torch.no_grad()
+def sgd_momentum_step(net: CNN9, gradsW, gradsb, vW, vb,
+                      lr=0.01, momentum=0.9, weight_decay=5e-4, clip=1.0):
+    for i in range(9):
+        dWi = gradsW[i] + weight_decay * getattr(net, f"W{i+1}")
+        dbi = gradsb[i]
+        
+        gn = (dWi.norm()**2 + dbi.norm()**2)**0.5
+        scale = 1.0 if gn <= clip else (clip / (gn + 1e-12))
+        dWi *= scale; dbi *= scale
+
+        vW[i].mul_(momentum).add_(dWi)
+        vb[i].mul_(momentum).add_(dbi)
+
+        getattr(net, f"W{i+1}").sub_(lr * vW[i])
+        getattr(net, f"b{i+1}").sub_(lr * vb[i])
+
+@torch.no_grad()
+def ema_update(ema_net: CNN9, net: CNN9, decay=0.999):
+    for i in range(1, 10):
+        for param in ["W", "b"]:
+            name = f"{param}{i}"
+            getattr(ema_net, name).mul_(decay).add_(getattr(net, name), alpha=(1.0 - decay))
+
+@torch.no_grad()
+def accuracy(net: CNN9, loader, device, max_batches=800):
+    correct = 0; total = 0
+    for i, (x,y) in enumerate(loader):
+        if i >= max_batches: break
+        x = x.to(device); y = y.to(device)
+        
+        h = x
+        h = relu(F.conv2d(h, net.W1, net.b1, stride=1, padding=1))
+        h = relu(F.conv2d(h, net.W2, net.b2, stride=2, padding=1))
+        h = relu(F.conv2d(h, net.W3, net.b3, stride=1, padding=1))
+        h = relu(F.conv2d(h, net.W4, net.b4, stride=2, padding=1))
+        h = relu(F.conv2d(h, net.W5, net.b5, stride=1, padding=1))
+        h = relu(F.conv2d(h, net.W6, net.b6, stride=2, padding=1))
+        h = relu(F.conv2d(h, net.W7, net.b7, stride=1, padding=1))
+        h = relu(F.conv2d(h, net.W8, net.b8, stride=2, padding=1))
+        logits = h.reshape(x.size(0), -1) @ net.W9.t() + net.b9
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / max(1, total)
+
+def kaiming_init(shape, device):
+    fan_in = (shape[1] * shape[2] * shape[3]) if len(shape) == 4 else shape[1]
+    return math.sqrt(2.0 / fan_in) * torch.randn(shape, device=device)
+
+def cosine_lr(step, total_steps, lr_max=0.05, lr_min=5e-4):
+    t = step / max(1, total_steps)
+    return lr_min + 0.5*(lr_max - lr_min)*(1.0 + math.cos(math.pi * t))
+
+class Cutout(object):
+    def __init__(self, length):
+        self.length = length
+    def __call__(self, img):
+        _, h, w = img.shape
+        mask = torch.ones((h, w), dtype=torch.float32)
+        y = torch.randint(h, (1,)).item()
+        x = torch.randint(w, (1,)).item()
+        y1 = max(0, y - self.length // 2)
+        y2 = min(h, y + self.length // 2)
+        x1 = max(0, x - self.length // 2)
+        x2 = min(w, x + self.length // 2)
+        img[:, y1:y2, x1:x2] = 0.0
+        return img
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    torch.backends.cudnn.benchmark = True
+
+    cifar_mean = (0.4914, 0.4822, 0.4465)
+    cifar_std  = (0.2470, 0.2435, 0.2616)
+    
+    train_tfm = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(cifar_mean, cifar_std),
+        Cutout(length=8)
+    ])
+    test_tfm = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(cifar_mean, cifar_std)
+    ])
+    
+    train_ds = datasets.CIFAR10("./data", train=True, download=True, transform=train_tfm)
+    test_ds  = datasets.CIFAR10("./data", train=False, download=True, transform=test_tfm)
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2, pin_memory=True)
+    test_loader  = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+
+    epochs = 100
+    eta_values = [0.25, 0.5, 0.75, 1.0]
+    K_limit = 1000
+    base_tolerance = 1e-6
+    lr_max = 0.035
+    lr_min = 0.0002
+    compare_every = 100  
+    
+    results = {}
+
+    for eta in eta_values:
+        # --- ADAPTIVE TOLERANCE LOGIC ---
+        current_tol = 9e-5 if eta >= 0.9 else base_tolerance
+        
+        print(f"\n========================================")
+        print(f"Training CNN9 (eta={eta}, K={K_limit}, tol={current_tol})")
+        print(f"========================================")
+        
+        W1 = kaiming_init((64, 3, 3, 3), device);   b1 = torch.zeros(64, device=device)
+        W2 = kaiming_init((64, 64, 3, 3), device);  b2 = torch.zeros(64, device=device)
+        W3 = kaiming_init((128, 64, 3, 3), device);  b3 = torch.zeros(128, device=device)
+        W4 = kaiming_init((128, 128, 3, 3), device); b4 = torch.zeros(128, device=device)
+        W5 = kaiming_init((256, 128, 3, 3), device); b5 = torch.zeros(256, device=device)
+        W6 = kaiming_init((256, 256, 3, 3), device); b6 = torch.zeros(256, device=device)
+        W7 = kaiming_init((512, 256, 3, 3), device); b7 = torch.zeros(512, device=device)
+        W8 = kaiming_init((512, 512, 3, 3), device); b8 = torch.zeros(512, device=device)
+        W9 = kaiming_init((10, 512*2*2), device);    b9 = torch.zeros(10, device=device)
+
+        net = CNN9(W1,b1,W2,b2,W3,b3,W4,b4,W5,b5,W6,b6,W7,b7,W8,b8,W9,b9)
+        ema_net = CNN9(W1.clone(),b1.clone(),W2.clone(),b2.clone(),W3.clone(),b3.clone(),
+                       W4.clone(),b4.clone(),W5.clone(),b5.clone(),W6.clone(),b6.clone(),
+                       W7.clone(),b7.clone(),W8.clone(),b8.clone(),W9.clone(),b9.clone())
+
+        vW = [torch.zeros_like(getattr(net, f"W{i}")) for i in range(1,10)]
+        vb = [torch.zeros_like(getattr(net, f"b{i}")) for i in range(1,10)]
+
+        total_steps = epochs * len(train_loader)
+        global_step = 0
+        state = XZState(64, device) 
+        
+        # --- GLOBAL LOGGING LISTS ---
+        cos_globalW_hist = []
+        relerr_globalW_hist = []
+        norm_ratio_hist = [] 
+        k_steps_hist = []
+        cos_steps = []
+        avg_steps_per_epoch = []
+        
+        # --- LAYER-WISE LOGGING LIST ---
+        # Format: List of dicts. Each dict has {step, layers: [{layer_id, cos, rel, true_norm, est_norm}, ...]}
+        layer_wise_metrics = []
+
+        for ep in range(1, epochs+1):
+            running_ce = 0.0
+            epoch_steps_accum = 0
+            num_batches = 0
+            
+            for i, (x, y) in enumerate(train_loader):
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                lr = cosine_lr(global_step, total_steps, lr_max=lr_max, lr_min=lr_min)
+
+                gradsW, gradsb, ce, steps_taken = xz_relax_batch_grad(
+                    net, x, y, eta=eta, K=K_limit, state=state, tol=current_tol, warm_start=True, beta=1.0
+                )
+                
+                # ---- LOGGING BLOCK EVERY 100 STEPS ----
+                if global_step % compare_every == 0:
+                    gradsW_ag, _, _ = autograd_grads_like_cnn9(net, x, y)
+                    
+                    # 1. Global Metrics (Flattened)
+                    gx = flat_cat(gradsW)
+                    ga = flat_cat(gradsW_ag)
+                    
+                    c_sim = cos_sim(gx, ga)
+                    r_err = relative_error(gx, ga)
+                    
+                    n_est = gx.norm().item()
+                    n_true = ga.norm().item()
+                    ratio = n_est / (n_true + 1e-12)
+                    
+                    cos_globalW_hist.append(c_sim)
+                    relerr_globalW_hist.append(r_err)
+                    norm_ratio_hist.append(ratio)
+                    k_steps_hist.append(steps_taken)
+                    cos_steps.append(global_step)
+                    
+                    # 2. Layer-wise Breakdown & True Norm Logging
+                    current_step_layer_stats = []
+                    
+                    # Loop W1 to W9
+                    for l_idx in range(9):
+                        g_est_l = gradsW[l_idx]
+                        g_true_l = gradsW_ag[l_idx]
+                        
+                        # Compute per-layer metrics
+                        l_cos = cos_sim(g_est_l, g_true_l)
+                        l_rel = relative_error(g_est_l, g_true_l)
+                        l_true_norm = g_true_l.norm().item()
+                        l_est_norm = g_est_l.norm().item()
+                        
+                        current_step_layer_stats.append({
+                            'layer': f"W{l_idx+1}",
+                            'cos_sim': l_cos,
+                            'rel_err': l_rel,
+                            'true_grad_norm': l_true_norm,  # |∇true|
+                            'est_grad_norm': l_est_norm     # |∇est|
+                        })
+                    
+                    # Store everything for post-processing
+                    layer_wise_metrics.append({
+                        'step': global_step,
+                        'layers': current_step_layer_stats
+                    })
+                    
+                    print(f"[Step {global_step}] Global Cos: {c_sim:.4f} | Global RelErr: {r_err:.4f} | "
+                          f"NormRatio: {ratio:.4f} | W9 RelErr: {current_step_layer_stats[-1]['rel_err']:.4f} | Last K: {steps_taken}")
+
+                sgd_momentum_step(net, gradsW, gradsb, vW, vb, lr=lr)
+                ema_update(ema_net, net, decay=0.9995)
+
+                global_step += 1
+                running_ce += ce
+                epoch_steps_accum += steps_taken
+                num_batches += 1
+
+            test_acc = accuracy(ema_net, test_loader, device)
+            train_loss = running_ce / num_batches
+            avg_k = epoch_steps_accum / num_batches
+            avg_steps_per_epoch.append(avg_k)
+            print(f">>> Ep {ep}: Loss {train_loss:.4f} | ACC {test_acc*100:.2f}% | Avg K: {avg_k:.1f}")
+
+        results[eta] = {
+            'cos_globalW_hist': cos_globalW_hist,
+            'relerr_globalW_hist': relerr_globalW_hist,
+            'norm_ratio_hist': norm_ratio_hist,
+            'k_steps_hist': k_steps_hist,
+            'cos_steps': cos_steps,
+            'avg_steps_per_epoch': avg_steps_per_epoch,
+            'layer_wise_metrics': layer_wise_metrics
+        }
+
+    print("\nSaving detailed results to experiment_data.pt ...")
+    torch.save(results, "experiment_data.pt")
+    print("Data Saved.")
+
+    print("Generating Plots...")
+    plot_results_icml(results, eta_values)
+    plot_convergence_icml(results, eta_values)
+    
+if __name__ == "__main__":
+    main()
