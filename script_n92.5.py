@@ -93,7 +93,7 @@ class XZState:
             self.__init__(B, device)
 
 # -----------------------------
-# Relaxation Gradient
+# Relaxation Gradient (ENHANCED WITH METRICS)
 # -----------------------------
 @torch.no_grad()
 def xz_relax_batch_grad(
@@ -103,6 +103,7 @@ def xz_relax_batch_grad(
     tol: float = 1e-4,
     warm_start: bool = True,
     beta: float = 1.0,
+    collect_convergence_metrics: bool = False,  # NEW FLAG
 ):
     device = net.device
     B = x0.shape[0]
@@ -119,6 +120,9 @@ def xz_relax_batch_grad(
         state.reset(B, device)
     
     x = state.x; z = state.z
+    
+    # NEW: Track convergence metrics during relaxation
+    convergence_history = [] if collect_convergence_metrics else None
     
     steps_taken = 0
     for _ in range(K):
@@ -151,20 +155,37 @@ def xz_relax_batch_grad(
         Jt[0] = -s[0] + F.conv_transpose2d(q[1], net.W2, stride=2, padding=1, output_padding=1)
 
         total_change = 0.0
+        max_change = 0.0
         # Hidden Layers
         for i in range(8):
             dx = F_err[i] + 0.5 * Jt[i]
             dz = F_err[i] - 0.5 * Jt[i]
             x[i].add_(dx, alpha=eta)
             z[i].add_(dz, alpha=eta)
-            total_change += dx.abs().mean().item()
+            change = dx.abs().mean().item()
+            total_change += change
+            max_change = max(max_change, change)
             
         # Output Layer
         dx8 = F_err[8] + 0.5 * Jt[8] + 0.5 * beta * g_last
         dz8 = F_err[8] - 0.5 * Jt[8] - 0.5 * beta * g_last
         x[8].add_(dx8, alpha=eta)
         z[8].add_(dz8, alpha=eta)
-        total_change += dx8.abs().mean().item()
+        change8 = dx8.abs().mean().item()
+        total_change += change8
+        max_change = max(max_change, change8)
+
+        # NEW: Collect convergence metrics
+        if collect_convergence_metrics:
+            # Compute fixed-point residuals
+            fixedpoint_residuals = [F_err[i].abs().mean().item() for i in range(9)]
+            convergence_history.append({
+                'iteration': steps_taken,
+                'total_change': total_change,
+                'max_change': max_change,
+                'fixedpoint_residuals': fixedpoint_residuals,
+                'avg_fixedpoint_residual': sum(fixedpoint_residuals) / len(fixedpoint_residuals)
+            })
 
         if total_change < tol:
             break
@@ -212,7 +233,12 @@ def xz_relax_batch_grad(
     gradsb.append(delta[8].mean(dim=0))
 
     ce = F.cross_entropy(m[8], y).item()
-    return tuple(gradsW), tuple(gradsb), ce, steps_taken -1
+    
+    # Return convergence history if collected
+    if collect_convergence_metrics:
+        return tuple(gradsW), tuple(gradsb), ce, steps_taken - 1, convergence_history
+    else:
+        return tuple(gradsW), tuple(gradsb), ce, steps_taken - 1
 
 # -----------------------------
 # Autograd Reference
@@ -248,7 +274,6 @@ def flat_cat(tup):
     return torch.cat([t.reshape(-1) for t in tup], dim=0)
 
 def cos_sim(a, b, eps=1e-12):
-    # Fix: Flatten tensors to 1D vectors before dot product
     a_flat = a.flatten()
     b_flat = b.flatten()
     denom = (a_flat.norm() * b_flat.norm()).clamp_min(eps)
@@ -256,6 +281,24 @@ def cos_sim(a, b, eps=1e-12):
 
 def relative_error(a, b, eps=1e-12):
     return float((a - b).norm() / b.norm().clamp_min(eps))
+
+def compute_bias_metrics(gradsW_est, gradsW_true):
+    """Compute bias (mean deviation) between estimated and true gradients"""
+    bias_per_layer = []
+    for i in range(len(gradsW_est)):
+        diff = gradsW_est[i] - gradsW_true[i]
+        bias = diff.mean().item()
+        bias_per_layer.append(bias)
+    return bias_per_layer
+
+def compute_variance_metrics(gradsW_est, gradsW_true):
+    """Compute variance of gradient estimation error"""
+    var_per_layer = []
+    for i in range(len(gradsW_est)):
+        diff = gradsW_est[i] - gradsW_true[i]
+        var = diff.var().item()
+        var_per_layer.append(var)
+    return var_per_layer
 
 def set_style():
     mpl.rcParams.update({
@@ -327,6 +370,38 @@ def plot_convergence_icml(results, eta_values):
     plt.tight_layout()
     plt.savefig('cnn9_convergence_steps.png', dpi=300)
     print("Saved cnn9_convergence_steps.png")
+
+def plot_gradient_noise(results, eta_values):
+    """Plot gradient noise ratio over training"""
+    set_style()
+    plt.figure()
+    
+    styles = {
+        0.25: {'color': '#1f77b4', 'linestyle': '-', 'label': r'$\eta=0.25$'},
+        0.50: {'color': '#ff7f0e', 'linestyle': '--', 'label': r'$\eta=0.50$'},
+        0.75: {'color': '#2ca02c', 'linestyle': '-.', 'label': r'$\eta=0.75$'},
+        1.00: {'color': '#d62728', 'linestyle': ':', 'label': r'$\eta=1.00$'},
+    }
+    
+    for eta in eta_values:
+        if eta not in results: continue
+        data = results[eta]
+        if 'gradient_snr' not in data: continue
+        
+        steps = data['cos_steps']
+        snr = data['gradient_snr']
+        
+        st = styles.get(eta, {'color': 'black', 'linestyle': '-'})
+        plt.plot(steps, snr, **st)
+
+    plt.xlabel('Training Steps')
+    plt.ylabel('Gradient SNR (Signal-to-Noise Ratio)')
+    plt.title('Gradient Estimation Quality')
+    plt.grid(True, which="both", ls=":", alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('cnn9_gradient_snr.png', dpi=300)
+    print("Saved cnn9_gradient_snr.png")
 
 # -----------------------------
 # Helpers
@@ -468,7 +543,7 @@ def main():
         global_step = 0
         state = XZState(64, device) 
         
-        # --- GLOBAL LOGGING LISTS ---
+        # --- ENHANCED LOGGING LISTS ---
         cos_globalW_hist = []
         relerr_globalW_hist = []
         norm_ratio_hist = [] 
@@ -476,27 +551,57 @@ def main():
         cos_steps = []
         avg_steps_per_epoch = []
         
-        # --- LAYER-WISE LOGGING LIST ---
-        # Format: List of dicts. Each dict has {step, layers: [{layer_id, cos, rel, true_norm, est_norm}, ...]}
+        # NEW METRICS
+        train_loss_hist = []
+        test_acc_hist = []
+        learning_rate_hist = []
+        gradient_norm_hist = []  # Track gradient magnitude
+        gradient_snr = []  # Signal-to-noise ratio
+        bias_metrics = []  # Per-layer bias
+        variance_metrics = []  # Per-layer variance
+        early_stop_ratio = []  # How often we stop early
+        
+        # Layer-wise metrics
         layer_wise_metrics = []
+        
+        # Convergence dynamics (collected less frequently)
+        convergence_samples = []
 
         for ep in range(1, epochs+1):
             running_ce = 0.0
             epoch_steps_accum = 0
             num_batches = 0
+            early_stops_this_epoch = 0
             
             for i, (x, y) in enumerate(train_loader):
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 lr = cosine_lr(global_step, total_steps, lr_max=lr_max, lr_min=lr_min)
 
-                gradsW, gradsb, ce, steps_taken = xz_relax_batch_grad(
-                    net, x, y, eta=eta, K=K_limit, state=state, tol=current_tol, warm_start=True, beta=1.0
+                # Decide whether to collect convergence metrics (only occasionally)
+                collect_conv = (global_step % (compare_every * 10) == 0)
+                
+                result = xz_relax_batch_grad(
+                    net, x, y, eta=eta, K=K_limit, state=state, 
+                    tol=current_tol, warm_start=True, beta=1.0,
+                    collect_convergence_metrics=collect_conv
                 )
+                
+                if collect_conv:
+                    gradsW, gradsb, ce, steps_taken, conv_history = result
+                    convergence_samples.append({
+                        'step': global_step,
+                        'convergence_history': conv_history
+                    })
+                else:
+                    gradsW, gradsb, ce, steps_taken = result
+                
+                if steps_taken < K_limit - 1:
+                    early_stops_this_epoch += 1
                 
                 # ---- LOGGING BLOCK EVERY 100 STEPS ----
                 if global_step % compare_every == 0:
-                    gradsW_ag, _, _ = autograd_grads_like_cnn9(net, x, y)
+                    gradsW_ag, gradsb_ag, _ = autograd_grads_like_cnn9(net, x, y)
                     
                     # 1. Global Metrics (Flattened)
                     gx = flat_cat(gradsW)
@@ -509,21 +614,42 @@ def main():
                     n_true = ga.norm().item()
                     ratio = n_est / (n_true + 1e-12)
                     
+                    # NEW: Compute gradient SNR (signal / noise)
+                    signal_power = (ga.norm() ** 2).item()
+                    noise_power = ((gx - ga).norm() ** 2).item()
+                    snr = signal_power / (noise_power + 1e-12)
+                    
                     cos_globalW_hist.append(c_sim)
                     relerr_globalW_hist.append(r_err)
                     norm_ratio_hist.append(ratio)
                     k_steps_hist.append(steps_taken)
                     cos_steps.append(global_step)
+                    gradient_norm_hist.append(n_true)
+                    gradient_snr.append(snr)
                     
-                    # 2. Layer-wise Breakdown & True Norm Logging
+                    # NEW: Compute bias and variance metrics
+                    bias_per_layer = compute_bias_metrics(gradsW, gradsW_ag)
+                    var_per_layer = compute_variance_metrics(gradsW, gradsW_ag)
+                    
+                    bias_metrics.append({
+                        'step': global_step,
+                        'layer_biases': bias_per_layer,
+                        'mean_bias': sum(bias_per_layer) / len(bias_per_layer)
+                    })
+                    
+                    variance_metrics.append({
+                        'step': global_step,
+                        'layer_variances': var_per_layer,
+                        'mean_variance': sum(var_per_layer) / len(var_per_layer)
+                    })
+                    
+                    # 2. Layer-wise Breakdown
                     current_step_layer_stats = []
                     
-                    # Loop W1 to W9
                     for l_idx in range(9):
                         g_est_l = gradsW[l_idx]
                         g_true_l = gradsW_ag[l_idx]
                         
-                        # Compute per-layer metrics
                         l_cos = cos_sim(g_est_l, g_true_l)
                         l_rel = relative_error(g_est_l, g_true_l)
                         l_true_norm = g_true_l.norm().item()
@@ -533,18 +659,17 @@ def main():
                             'layer': f"W{l_idx+1}",
                             'cos_sim': l_cos,
                             'rel_err': l_rel,
-                            'true_grad_norm': l_true_norm,  # |∇true|
-                            'est_grad_norm': l_est_norm     # |∇est|
+                            'true_grad_norm': l_true_norm,
+                            'est_grad_norm': l_est_norm
                         })
                     
-                    # Store everything for post-processing
                     layer_wise_metrics.append({
                         'step': global_step,
                         'layers': current_step_layer_stats
                     })
                     
                     print(f"[Step {global_step}] Global Cos: {c_sim:.4f} | Global RelErr: {r_err:.4f} | "
-                          f"NormRatio: {ratio:.4f} | W9 RelErr: {current_step_layer_stats[-1]['rel_err']:.4f} | Last K: {steps_taken}")
+                          f"NormRatio: {ratio:.4f} | SNR: {snr:.2f} | Last K: {steps_taken}")
 
                 sgd_momentum_step(net, gradsW, gradsb, vW, vb, lr=lr)
                 ema_update(ema_net, net, decay=0.9995)
@@ -553,30 +678,51 @@ def main():
                 running_ce += ce
                 epoch_steps_accum += steps_taken
                 num_batches += 1
+                learning_rate_hist.append(lr)
 
             test_acc = accuracy(ema_net, test_loader, device)
             train_loss = running_ce / num_batches
             avg_k = epoch_steps_accum / num_batches
+            early_stop_pct = early_stops_this_epoch / num_batches
+            
             avg_steps_per_epoch.append(avg_k)
-            print(f">>> Ep {ep}: Loss {train_loss:.4f} | ACC {test_acc*100:.2f}% | Avg K: {avg_k:.1f}")
+            train_loss_hist.append(train_loss)
+            test_acc_hist.append(test_acc)
+            early_stop_ratio.append(early_stop_pct)
+            
+            print(f">>> Ep {ep}: Loss {train_loss:.4f} | ACC {test_acc*100:.2f}% | "
+                  f"Avg K: {avg_k:.1f} | Early Stop: {early_stop_pct*100:.1f}%")
 
         results[eta] = {
+            # Original metrics
             'cos_globalW_hist': cos_globalW_hist,
             'relerr_globalW_hist': relerr_globalW_hist,
             'norm_ratio_hist': norm_ratio_hist,
             'k_steps_hist': k_steps_hist,
             'cos_steps': cos_steps,
             'avg_steps_per_epoch': avg_steps_per_epoch,
-            'layer_wise_metrics': layer_wise_metrics
+            'layer_wise_metrics': layer_wise_metrics,
+            
+            # NEW METRICS
+            'train_loss_hist': train_loss_hist,
+            'test_acc_hist': test_acc_hist,
+            'learning_rate_hist': learning_rate_hist,
+            'gradient_norm_hist': gradient_norm_hist,
+            'gradient_snr': gradient_snr,
+            'bias_metrics': bias_metrics,
+            'variance_metrics': variance_metrics,
+            'early_stop_ratio': early_stop_ratio,
+            'convergence_samples': convergence_samples,
         }
 
-    print("\nSaving detailed results to experiment_data.pt ...")
+    print("\nSaving detailed results to experiment_data_enhanced.pt ...")
     torch.save(results, "experiment_data.pt")
     print("Data Saved.")
 
     print("Generating Plots...")
     plot_results_icml(results, eta_values)
     plot_convergence_icml(results, eta_values)
+    plot_gradient_noise(results, eta_values)
     
 if __name__ == "__main__":
     main()
