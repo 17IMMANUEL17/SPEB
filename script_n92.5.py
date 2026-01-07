@@ -1,25 +1,113 @@
+"""
+REPRODUCIBILITY METADATA & INSTRUCTIONS
+---------------------------------------
+For strict bit-exact reproducibility (ICML standard), you must match the environment.
+Code determinism alone is insufficient across different hardware architectures due
+to non-associative floating-point arithmetic.
+
+1. Dependencies:
+   Ensure you use exact library versions. Run:
+   pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121 numpy==1.26.3 matplotlib==3.8.2
+
+2. Hardware Note:
+   This code is deterministic. However, running on different GPU architectures
+   (e.g., RTX 3090 vs A100) will yield slightly different trajectories due to
+   hardware-level implementation differences in cuBLAS.
+   
+   To reproduce the exact numbers reported, use: [Insert Your GPU Here, e.g., RTX 4090]
+"""
+
+import os
+import random
+import sys
+
+# -----------------------------
+# 0. STRICT REPRODUCIBILITY SETUP
+# -----------------------------
+# CRITICAL: Must be set before ANY torch imports.
+# Enables deterministic algorithms in cuBLAS (used by PyTorch for matmul/conv).
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["PYTHONHASHSEED"] = "42"
+
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from torch.nn.grad import conv2d_weight
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from dataclasses import dataclass
-from torch.nn.grad import conv2d_weight
-import os
 
+# -----------------------------
+# 1. PRECISION & HARDWARE CONTROL
+# -----------------------------
+# CRITICAL: Disable TensorFloat-32 (TF32) on Ampere+ GPUs (A100, RTX 3090/4090, H100).
+# TF32 is non-deterministic relative to standard FP32 and causes silent precision loss.
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+# Ensure standard float32 precision
 torch.set_default_dtype(torch.float32)
 
 # -----------------------------
-# Activations
+# 2. SEEDING & WORKER SETUP
+# -----------------------------
+def seed_everything(seed=42):
+    """
+    Sets seeds for Python, NumPy, and PyTorch to ensure reproducible results.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # If using multi-GPU
+    
+    # Ensure deterministic behavior in CuDNN
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # Force deterministic algorithms. 
+    # warn_only=False ensures strict compliance (crashes if an op is non-deterministic)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+    except AttributeError:
+        # Fallback for older PyTorch versions
+        torch.use_deterministic_algorithms(True)
+
+def seed_worker(worker_id):
+    """
+    Worker initialization function for DataLoader to ensure each worker 
+    operates with a deterministic seed derived from the base seed.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def print_env_info():
+    """Prints environment info for reproducibility logs."""
+    print("\n" + "="*40)
+    print("REPRODUCIBILITY ENVIRONMENT CHECK")
+    print("="*40)
+    print(f"Python Version: {sys.version.split()[0]}")
+    print(f"PyTorch Version: {torch.__version__}")
+    print(f"CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"Device Name: {torch.cuda.get_device_name(0)}")
+        print(f"TF32 Allowed (Matmul): {torch.backends.cuda.matmul.allow_tf32}")
+        print(f"TF32 Allowed (CuDNN): {torch.backends.cudnn.allow_tf32}")
+    print("="*40 + "\n")
+
+# -----------------------------
+# Activations & Model
 # -----------------------------
 def relu(u): return torch.relu(u)
 def relu_prime(u): return (u > 0).to(u.dtype)
 
-# -----------------------------
-# Model container (CNN9)
-# -----------------------------
 @dataclass
 class CNN9:
     # Block 1: 32x32 -> 16x16
@@ -45,7 +133,7 @@ class CNN9:
     def device(self): return self.W1.device
 
 # -----------------------------
-# Forward at mean states
+# Forward & Gradients
 # -----------------------------
 @torch.no_grad()
 def forward_u_sig(net: CNN9, x0, m):
@@ -92,9 +180,6 @@ class XZState:
         if self.x[0].shape[0] != B:
             self.__init__(B, device)
 
-# -----------------------------
-# Relaxation Gradient (ENHANCED WITH METRICS)
-# -----------------------------
 @torch.no_grad()
 def xz_relax_batch_grad(
     net: CNN9, x0, y,
@@ -103,7 +188,7 @@ def xz_relax_batch_grad(
     tol: float = 1e-4,
     warm_start: bool = True,
     beta: float = 1.0,
-    collect_convergence_metrics: bool = False,  # NEW FLAG
+    collect_convergence_metrics: bool = False,
 ):
     device = net.device
     B = x0.shape[0]
@@ -121,7 +206,6 @@ def xz_relax_batch_grad(
     
     x = state.x; z = state.z
     
-    # NEW: Track convergence metrics during relaxation
     convergence_history = [] if collect_convergence_metrics else None
     
     steps_taken = 0
@@ -175,9 +259,7 @@ def xz_relax_batch_grad(
         total_change += change8
         max_change = max(max_change, change8)
 
-        # NEW: Collect convergence metrics
         if collect_convergence_metrics:
-            # Compute fixed-point residuals
             fixedpoint_residuals = [F_err[i].abs().mean().item() for i in range(9)]
             convergence_history.append({
                 'iteration': steps_taken,
@@ -203,7 +285,7 @@ def xz_relax_batch_grad(
     gradsW = []
     gradsb = []
 
-    # Manual conv gradients to match architecture
+    # Manual conv gradients
     gradsW.append(conv2d_weight(x0, net.W1.shape, delta[0], stride=1, padding=1) / B)
     gradsb.append(delta[0].sum(dim=(0,2,3)) / B)
     
@@ -234,7 +316,6 @@ def xz_relax_batch_grad(
 
     ce = F.cross_entropy(m[8], y).item()
     
-    # Return convergence history if collected
     if collect_convergence_metrics:
         return tuple(gradsW), tuple(gradsb), ce, steps_taken - 1, convergence_history
     else:
@@ -283,7 +364,6 @@ def relative_error(a, b, eps=1e-12):
     return float((a - b).norm() / b.norm().clamp_min(eps))
 
 def compute_bias_metrics(gradsW_est, gradsW_true):
-    """Compute bias (mean deviation) between estimated and true gradients"""
     bias_per_layer = []
     for i in range(len(gradsW_est)):
         diff = gradsW_est[i] - gradsW_true[i]
@@ -292,7 +372,6 @@ def compute_bias_metrics(gradsW_est, gradsW_true):
     return bias_per_layer
 
 def compute_variance_metrics(gradsW_est, gradsW_true):
-    """Compute variance of gradient estimation error"""
     var_per_layer = []
     for i in range(len(gradsW_est)):
         diff = gradsW_est[i] - gradsW_true[i]
@@ -372,7 +451,6 @@ def plot_convergence_icml(results, eta_values):
     print("Saved cnn9_convergence_steps.png")
 
 def plot_gradient_noise(results, eta_values):
-    """Plot gradient noise ratio over training"""
     set_style()
     plt.figure()
     
@@ -479,10 +557,13 @@ class Cutout(object):
 # Main
 # -----------------------------
 def main():
+    # 1. INITIAL SEED (Global setup)
+    print_env_info()
+    seed_everything(42)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    torch.backends.cudnn.benchmark = True
-
+    
     cifar_mean = (0.4914, 0.4822, 0.4465)
     cifar_std  = (0.2470, 0.2435, 0.2616)
     
@@ -500,8 +581,34 @@ def main():
     
     train_ds = datasets.CIFAR10("./data", train=True, download=True, transform=train_tfm)
     test_ds  = datasets.CIFAR10("./data", train=False, download=True, transform=test_tfm)
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2, pin_memory=True)
-    test_loader  = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=2, pin_memory=True)
+    
+    # --- REPRODUCIBLE DATALOADERS ---
+    # We must use a separate generator for the DataLoader shuffler
+    g_train = torch.Generator()
+    g_train.manual_seed(42)
+    
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=64, 
+        shuffle=True, 
+        num_workers=2, 
+        pin_memory=True,
+        worker_init_fn=seed_worker,  # Ensure workers are seeded deterministically
+        generator=g_train            # Ensure shuffling is deterministic
+    )
+    
+    g_test = torch.Generator()
+    g_test.manual_seed(42)
+    
+    test_loader  = DataLoader(
+        test_ds, 
+        batch_size=256, 
+        shuffle=False, 
+        num_workers=2, 
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=g_test
+    )
 
     epochs = 100
     eta_values = [0.25, 0.5, 0.75, 1.0]
@@ -514,13 +621,17 @@ def main():
     results = {}
 
     for eta in eta_values:
-        # --- ADAPTIVE TOLERANCE LOGIC ---
+        # Adaptive tolerance logic
         current_tol = 9e-5 if eta >= 0.9 else base_tolerance
         
         print(f"\n========================================")
         print(f"Training CNN9 (eta={eta}, K={K_limit}, tol={current_tol})")
         print(f"========================================")
         
+        # 2. RESEED INSIDE LOOP
+        # Essential: Ensures every eta experiment starts from the exact same weights
+        seed_everything(42)
+
         W1 = kaiming_init((64, 3, 3, 3), device);   b1 = torch.zeros(64, device=device)
         W2 = kaiming_init((64, 64, 3, 3), device);  b2 = torch.zeros(64, device=device)
         W3 = kaiming_init((128, 64, 3, 3), device);  b3 = torch.zeros(128, device=device)
@@ -543,7 +654,7 @@ def main():
         global_step = 0
         state = XZState(64, device) 
         
-        # --- ENHANCED LOGGING LISTS ---
+        # Logging lists
         cos_globalW_hist = []
         relerr_globalW_hist = []
         norm_ratio_hist = [] 
@@ -551,20 +662,15 @@ def main():
         cos_steps = []
         avg_steps_per_epoch = []
         
-        # NEW METRICS
         train_loss_hist = []
         test_acc_hist = []
         learning_rate_hist = []
-        gradient_norm_hist = []  # Track gradient magnitude
-        gradient_snr = []  # Signal-to-noise ratio
-        bias_metrics = []  # Per-layer bias
-        variance_metrics = []  # Per-layer variance
-        early_stop_ratio = []  # How often we stop early
-        
-        # Layer-wise metrics
+        gradient_norm_hist = []
+        gradient_snr = []
+        bias_metrics = []
+        variance_metrics = []
+        early_stop_ratio = []
         layer_wise_metrics = []
-        
-        # Convergence dynamics (collected less frequently)
         convergence_samples = []
 
         for ep in range(1, epochs+1):
@@ -578,7 +684,6 @@ def main():
                 y = y.to(device, non_blocking=True)
                 lr = cosine_lr(global_step, total_steps, lr_max=lr_max, lr_min=lr_min)
 
-                # Decide whether to collect convergence metrics (only occasionally)
                 collect_conv = (global_step % (compare_every * 10) == 0)
                 
                 result = xz_relax_batch_grad(
@@ -603,7 +708,6 @@ def main():
                 if global_step % compare_every == 0:
                     gradsW_ag, gradsb_ag, _ = autograd_grads_like_cnn9(net, x, y)
                     
-                    # 1. Global Metrics (Flattened)
                     gx = flat_cat(gradsW)
                     ga = flat_cat(gradsW_ag)
                     
@@ -614,7 +718,6 @@ def main():
                     n_true = ga.norm().item()
                     ratio = n_est / (n_true + 1e-12)
                     
-                    # NEW: Compute gradient SNR (signal / noise)
                     signal_power = (ga.norm() ** 2).item()
                     noise_power = ((gx - ga).norm() ** 2).item()
                     snr = signal_power / (noise_power + 1e-12)
@@ -627,7 +730,6 @@ def main():
                     gradient_norm_hist.append(n_true)
                     gradient_snr.append(snr)
                     
-                    # NEW: Compute bias and variance metrics
                     bias_per_layer = compute_bias_metrics(gradsW, gradsW_ag)
                     var_per_layer = compute_variance_metrics(gradsW, gradsW_ag)
                     
@@ -643,9 +745,7 @@ def main():
                         'mean_variance': sum(var_per_layer) / len(var_per_layer)
                     })
                     
-                    # 2. Layer-wise Breakdown
                     current_step_layer_stats = []
-                    
                     for l_idx in range(9):
                         g_est_l = gradsW[l_idx]
                         g_true_l = gradsW_ag[l_idx]
@@ -694,7 +794,6 @@ def main():
                   f"Avg K: {avg_k:.1f} | Early Stop: {early_stop_pct*100:.1f}%")
 
         results[eta] = {
-            # Original metrics
             'cos_globalW_hist': cos_globalW_hist,
             'relerr_globalW_hist': relerr_globalW_hist,
             'norm_ratio_hist': norm_ratio_hist,
@@ -702,8 +801,6 @@ def main():
             'cos_steps': cos_steps,
             'avg_steps_per_epoch': avg_steps_per_epoch,
             'layer_wise_metrics': layer_wise_metrics,
-            
-            # NEW METRICS
             'train_loss_hist': train_loss_hist,
             'test_acc_hist': test_acc_hist,
             'learning_rate_hist': learning_rate_hist,
@@ -716,7 +813,7 @@ def main():
         }
 
     print("\nSaving detailed results to experiment_data_enhanced.pt ...")
-    torch.save(results, "experiment_data.pt")
+    torch.save(results, "experiment_data_seed11_18convergence.pt")
     print("Data Saved.")
 
     print("Generating Plots...")
